@@ -1,7 +1,10 @@
 import type { ContractDefinition, FunctionDefinition } from 'solidity-ast';
+import type { Node } from 'solidity-ast/node';
 import { ASTDereferencer, findAll } from 'solidity-ast/utils';
 import { SrcDecoder } from '../../src-decoder';
-import { ValidationExceptionInitializer, skipCheck } from '../run';
+import { ValidationExceptionInitializer, skipCheck, tryDerefFunction } from '../run';
+import { getAnnotationArgs, getDocumentation, hasAnnotationTag } from '../../utils/annotations';
+import { logNote } from '../../utils/log';
 
 /**
  * Reports if this contract is non-abstract and any of the following are true:
@@ -20,12 +23,12 @@ export function* getInitializerExceptions(
   }
 
   const linearizedParentContracts = getLinearizedParentContracts(contractDef, deref);
-  const parentNameToInitializersMap = getParentNameToInitializersMap(linearizedParentContracts);
+  const parentNameToInitializersMap = getParentNameToInitializersMap(linearizedParentContracts, decodeSrc);
 
   const remainingParents = getParentsNotInitializedByOtherParents(parentNameToInitializersMap);
 
   if (remainingParents.length > 0) {
-    const contractInitializers = getPossibleInitializers(contractDef, false);
+    const contractInitializers = getPossibleInitializers(contractDef, false, decodeSrc);
 
     // Report if there is no initializer but parents need initialization
     if (
@@ -71,10 +74,10 @@ function getLinearizedParentContracts(contractDef: ContractDefinition, deref: AS
  * Gets a map of parent contract names to their possible initializers.
  * If a parent contract has no initializers, it is not included in the map.
  */
-function getParentNameToInitializersMap(linearizedParentContracts: ContractDefinition[]) {
+function getParentNameToInitializersMap(linearizedParentContracts: ContractDefinition[], decodeSrc: SrcDecoder) {
   const map = new Map();
   for (const parent of linearizedParentContracts) {
-    const initializers = getPossibleInitializers(parent, true);
+    const initializers = getPossibleInitializers(parent, true, decodeSrc);
     if (initializers.length > 0) {
       map.set(parent.name, initializers);
     }
@@ -142,6 +145,27 @@ function getParentsNotInitializedByOtherParents(
 }
 
 /**
+ * Calls the callback if the referenced function definition is found in the AST.
+ * Otherwise, does nothing.
+ *
+ * @param deref AST dereferencer
+ * @param referencedDeclaration ID of the referenced function
+ * @param callback Function to call if the referenced function definition is found
+ */
+function doIfReferencedFunctionFound(
+  deref: ASTDereferencer,
+  referencedDeclaration: number | null | undefined,
+  callback: (functionDef: FunctionDefinition) => void,
+) {
+  if (referencedDeclaration && referencedDeclaration > 0) {
+    const functionDef = tryDerefFunction(deref, referencedDeclaration);
+    if (functionDef !== undefined) {
+      callback(functionDef);
+    }
+  }
+}
+
+/**
  * Reports exceptions for missing initializer calls, duplicate initializer calls, and incorrect initializer order.
  *
  * @param contractInitializer An initializer function for the current contract
@@ -176,10 +200,9 @@ function* getInitializerCallExceptions(
       (fnCall.expression.nodeType === 'Identifier' || fnCall.expression.nodeType === 'MemberAccess')
     ) {
       let recursiveFunctionIds: number[] = [];
-      const referencedFn = fnCall.expression.referencedDeclaration;
-      if (referencedFn && referencedFn > 0) {
-        recursiveFunctionIds = getRecursiveFunctionIds(referencedFn, deref);
-      }
+      doIfReferencedFunctionFound(deref, fnCall.expression.referencedDeclaration, (functionDef: FunctionDefinition) => {
+        recursiveFunctionIds = getRecursiveFunctionIds(deref, functionDef);
+      });
 
       // For each recursively called function, if it is a parent initializer, then:
       // - Check if it was already called (duplicate call)
@@ -258,59 +281,105 @@ function* getInitializerCallExceptions(
 /**
  * Gets the IDs of all functions that are recursively called by the given function, including the given function itself at the end of the list.
  *
- * @param referencedFn The ID of the function to start from
  * @param deref AST dereferencer
+ * @param functionDef The node of the function definition to start from
  * @param visited Set of function IDs that have already been visited
  * @returns The IDs of all functions that are recursively called by the given function, including the given function itself at the end of the list.
  */
-function getRecursiveFunctionIds(referencedFn: number, deref: ASTDereferencer, visited?: Set<number>): number[] {
+function getRecursiveFunctionIds(
+  deref: ASTDereferencer,
+  functionDef: FunctionDefinition,
+  visited?: Set<number>,
+): number[] {
   const result: number[] = [];
 
   if (visited === undefined) {
     visited = new Set();
   }
-  if (visited.has(referencedFn)) {
+  if (visited.has(functionDef.id)) {
     return result;
   } else {
-    visited.add(referencedFn);
+    visited.add(functionDef.id);
   }
 
-  const fn = deref('FunctionDefinition', referencedFn);
-  const expressionStatements = fn.body?.statements?.filter(stmt => stmt.nodeType === 'ExpressionStatement') ?? [];
+  const expressionStatements =
+    functionDef.body?.statements?.filter(stmt => stmt.nodeType === 'ExpressionStatement') ?? [];
   for (const stmt of expressionStatements) {
     const fnCall = stmt.expression;
     if (
       fnCall.nodeType === 'FunctionCall' &&
       (fnCall.expression.nodeType === 'Identifier' || fnCall.expression.nodeType === 'MemberAccess')
     ) {
-      const referencedId = fnCall.expression.referencedDeclaration;
-      if (referencedId && referencedId > 0) {
-        result.push(...getRecursiveFunctionIds(referencedId, deref, visited));
-      }
+      doIfReferencedFunctionFound(deref, fnCall.expression.referencedDeclaration, (functionDef: FunctionDefinition) => {
+        result.push(...getRecursiveFunctionIds(deref, functionDef, visited));
+      });
     }
   }
-  result.push(referencedFn);
+  result.push(functionDef.id);
 
   return result;
 }
 
 /**
- * Get all functions that could be initializers. Does not include private functions.
+ * Get all functions that are annotated as initializers or are inferred to be initializers.
+ * Logs a note if any reinitializer is found.
+ */
+function getPossibleInitializers(
+  contractDef: ContractDefinition,
+  isParentContract: boolean,
+  decodeSrc: SrcDecoder,
+): FunctionDefinition[] {
+  const fns = [...findAll('FunctionDefinition', contractDef)];
+  return fns.filter((fnDef: FunctionDefinition) => {
+    const validateAsInitializer = hasValidateAsInitializerAnnotation(fnDef, decodeSrc);
+    if (!validateAsInitializer && fnDef.modifiers.some(modifier => 'reinitializer' === modifier.modifierName.name)) {
+      logNote(`Reinitializers are not included in validations by default`, [
+        `${decodeSrc(fnDef)}: If you want to validate this function as an initializer, annotate it with '@custom:oz-upgrades-validate-as-initializer'`,
+      ]);
+    }
+
+    return inferPossibleInitializer(fnDef, validateAsInitializer, isParentContract);
+  });
+}
+
+function hasValidateAsInitializerAnnotation(node: Node, decodeSrc: SrcDecoder): boolean {
+  const doc = getDocumentation(node);
+  const tag = 'oz-upgrades-validate-as-initializer';
+  const validateAsInitializer = hasAnnotationTag(doc, tag);
+  if (validateAsInitializer) {
+    const annotationArgs = getAnnotationArgs(doc, tag);
+    if (annotationArgs.length !== 0) {
+      throw new Error(`${decodeSrc(node)}: @custom:${tag} annotation must not have any arguments`);
+    }
+  }
+  return validateAsInitializer;
+}
+
+function hasInitializerNameOrModifier(fnDef: FunctionDefinition) {
+  return (
+    fnDef.modifiers.some(modifier => ['initializer', 'onlyInitializing'].includes(modifier.modifierName.name)) ||
+    ['initialize', 'initializer'].includes(fnDef.name)
+  );
+}
+
+/**
+ * Infers whether a function could be an initializer. Does not include private functions.
  * For parent contracts, only internal and public functions which contain statements are included.
  */
-function getPossibleInitializers(contractDef: ContractDefinition, isParentContract: boolean) {
-  const fns = [...findAll('FunctionDefinition', contractDef)];
-  return fns.filter(
-    fnDef =>
-      (fnDef.modifiers.some(modifier => ['initializer', 'onlyInitializing'].includes(modifier.modifierName.name)) ||
-        ['initialize', 'initializer'].includes(fnDef.name)) &&
-      // Skip virtual functions without a body, since that indicates an abstract function and is not itself an initializer
-      !(fnDef.virtual && !fnDef.body) &&
-      // Ignore private functions, since they cannot be called outside the contract
-      fnDef.visibility !== 'private' &&
-      // For parent contracts, only internal and public functions which contain statements need to be called
-      (isParentContract
-        ? fnDef.body?.statements?.length && (fnDef.visibility === 'internal' || fnDef.visibility === 'public')
-        : true),
+function inferPossibleInitializer(
+  fnDef: FunctionDefinition,
+  validateAsInitializer: boolean,
+  isParentContract: boolean,
+): boolean {
+  return (
+    (validateAsInitializer || hasInitializerNameOrModifier(fnDef)) &&
+    // Skip virtual functions without a body, since that indicates an abstract function and is not itself an initializer
+    !(fnDef.virtual && !fnDef.body) &&
+    // Ignore private functions, since they cannot be called outside the contract
+    fnDef.visibility !== 'private' &&
+    // For parent contracts, only internal and public functions which contain statements need to be called
+    (isParentContract
+      ? Boolean(fnDef.body?.statements?.length) && (fnDef.visibility === 'internal' || fnDef.visibility === 'public')
+      : true)
   );
 }
